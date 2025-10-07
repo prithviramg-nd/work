@@ -198,6 +198,9 @@ if __name__ == "__main__":
     logger.add(sys.stderr, level=LOG_LEVEL)
 
     # add your AWS credentials here if not already configured in your environment
+    # os.environ['AWS_ACCESS_KEY_ID'] = 'your_access_key_id'
+    # os.environ['AWS_SECRET_ACCESS_KEY'] = 'your
+    # os.environ['AWS_SESSION_TOKEN'] = 'your_session_token'
             
     query = '''
       SELECT avid, s3_bucket
