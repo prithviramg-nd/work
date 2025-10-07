@@ -4,17 +4,18 @@ from loguru import logger
 import sys
 import json
 import pandas as pd
+import numpy as np
 import os
 import p_tqdm
 import multiprocessing
 from sqlalchemy import create_engine
 from moviepy.editor import VideoFileClip
-print("moviepy import successful")
+from PIL import ImageDraw, Image
 
 FPS =  30
 LABELLING_S3_BUCKET = 'netradyne-labelling-production'
 LABELLING_S3_PREFIX = 'dms_eec_alert_level_labelling_robust_v0.1'
-VIDEO_OFFSET = 2 # offset in seconds to start the video before the event start time
+VIDEO_OFFSET = 500 # offset in milliseconds to start the video before the event start time
 
 def get_EEC_events(json_path: str) -> pd.DataFrame:
     """
@@ -35,8 +36,8 @@ def get_EEC_events(json_path: str) -> pd.DataFrame:
             rows.append({
                 'avid': avid,
                 'avid_folder_name': avid_folder_name,
-                'start_timestamp': each_alert['start_timestamp']/1000,
-                'end_timestamp': each_alert['end_timestamp']/1000,
+                'start_timestamp': each_alert['start_timestamp'],
+                'end_timestamp': each_alert['end_timestamp'],
                 'event_code': each_alert['event_code'],
                 'uuid': each_alert['uuid'],
                 'alert_id': each_alert['alert_id'],
@@ -51,6 +52,66 @@ def get_EEC_events(json_path: str) -> pd.DataFrame:
         'alert_id': None,
     }])
 
+def calculate_frame_numbers(video_start: int,
+                            video_end: int,
+                            event_start: int,
+                            event_end: int,
+                            each_df_row: dict,
+                            fps: int = FPS) -> tuple[int, int, int, int]:
+    """
+    Calculates frame numbers to extract from a video based on event timestamps.
+    Args:
+        video_start (int): Start time of the video in milliseconds.
+        video_end (int): End time of the video in milliseconds.
+        event_start (int): Start time of the event in milliseconds.
+        event_end (int): End time of the event in milliseconds.
+        each_df_row (dict): Metadata for the video/event.
+        fps (int): Frames per second of the video.
+    Returns:
+        tuple[int, int, int, int]: A tuple containing the start frame, end frame, event start frame, and event end frame.
+    """
+    event_start = max(video_start, event_start)
+    event_end = min(video_end, event_end)
+    event_duration = event_end - event_start
+    assert event_duration > 0, f"Event duration must be positive, and corresponding df row is {each_df_row}"
+    event_start_frame_idx = int((event_start - video_start) * fps / 1000)
+    event_end_frame_idx = int((event_end - video_start) * fps / 1000)
+    return event_start_frame_idx, event_end_frame_idx
+
+def annotate_frames(frame_files: list[str], 
+                    event_start_frame: int, 
+                    event_end_frame: int, 
+                    each_df_row: dict) -> None:
+    """
+    Annotates frames when the event occurs.
+    Args:
+        frame_files (list[str]): List of frame file paths.
+        event_start_frame (int): Frame index where the event starts.
+        event_end_frame (int): Frame index where the event ends.
+        each_df_row (dict): Metadata for the video/event.
+    Returns:
+        None
+    """
+    for idx, frame_file in enumerate(frame_files):
+        try:
+            with Image.open(frame_file) as img:
+                draw = ImageDraw.Draw(img)
+                countdown = idx
+                while (countdown >= 0): # annotating the frame with event start and end frames
+                    color = (255, 0, 0) if event_start_frame <= countdown <= event_end_frame else (255, 255, 255) # Red for event frames, White otherwise
+                    y_center = 120 if event_start_frame <= countdown <= event_end_frame else 200
+                    x_center = (img.width // len(frame_files)) * countdown + 10
+                    draw.circle((x_center, y_center), 5, fill=color)
+                    if countdown != idx:
+                        prev_x_center = (img.width // len(frame_files)) * (countdown + 1) + 10
+                        prev_y_center = 120 if event_start_frame <= (countdown + 1) <= event_end_frame else 200
+                        draw.line((prev_x_center, prev_y_center, x_center, y_center), fill=color, width=2)
+                    countdown -= 1
+                img.save(frame_file)
+        except Exception as e:
+            logger.error(f"Error annotating frame {frame_file}: {e} and corresponding df row is {each_df_row}")
+    return 
+
 def process_video(each_df_row: dict) -> None:
     """
     Processes a single video based on metadata from a DataFrame row.
@@ -63,6 +124,7 @@ def process_video(each_df_row: dict) -> None:
     Returns:
         None
     """
+    # Download video from S3
     s3_client = boto3.client('s3')
     s3_bucket, s3_folder_prefix = each_df_row['s3_bucket'].split('/', 1)
     os.makedirs(f"temp/{each_df_row['uuid']}", exist_ok=True)
@@ -74,19 +136,43 @@ def process_video(each_df_row: dict) -> None:
         logger.error(f"Error downloading {each_df_row['avid']} from S3: {e}")
         return
     
+    # Extract frames using ffmpeg
     try:
         frames_dir = f"temp/{each_df_row['uuid']}/frames"
         os.makedirs(frames_dir, exist_ok=True)
         logger.debug(f"Extracting frames from {local_video_path} to {frames_dir}")
 
-        video_duration = VideoFileClip(local_video_path).duration
-        start_time = max(0, int(each_df_row['start_timestamp'] - VIDEO_OFFSET))  # in seconds
-        end_time = min(video_duration, int(each_df_row['end_timestamp'] + VIDEO_OFFSET))  # in seconds
+        video_duration = VideoFileClip(local_video_path).duration * 1000  # in milliseconds
+        start_time = max(0, int(each_df_row['start_timestamp'] - VIDEO_OFFSET))  # in milliseconds
+        end_time = min(video_duration, int(each_df_row['end_timestamp'] + VIDEO_OFFSET))  # in milliseconds
         duration = end_time - start_time
-        os.system(f"ffmpeg -ss {start_time} -i {local_video_path} -t {duration} -vf fps={FPS} -start_number 0 {frames_dir}/frame_%04d.jpg > /dev/null 2>&1")
+        os.system(f"ffmpeg -ss {start_time/1000} -i {local_video_path} -t {duration/1000} -vf fps={FPS} -start_number 0 {frames_dir}/%04d.jpg > /dev/null 2>&1")
         logger.debug(f"Extracted frames to {frames_dir} from {start_time} to {end_time} seconds")
     except Exception as e:
         logger.error(f"Error in extracting frames for video {each_df_row['avid']}: {e}")
+
+    # annotate frames
+    try:
+        frame_files = sorted(glob.glob(f"{frames_dir}/*.jpg")) # frame files containing full path in a sorted manner
+        event_start_frame, event_end_frame = calculate_frame_numbers(video_start=start_time,
+                                                                     video_end=end_time,
+                                                                     event_start=each_df_row['start_timestamp'],
+                                                                     event_end=each_df_row['end_timestamp'], 
+                                                                     each_df_row=each_df_row)
+        annotate_frames(frame_files, event_start_frame, event_end_frame, each_df_row)        
+    except Exception as e:
+        logger.error(f"Error annotating frames for video {each_df_row['avid']}: {e}")
+
+    # Upload frames to S3
+    temp_uuid = each_df_row['uuid']
+    formatted_uuid = f"{temp_uuid[:8]}-{temp_uuid[8:12]}-{temp_uuid[12:16]}-{temp_uuid[16:20]}-{temp_uuid[20:]}"
+    try:
+        for frame_file in frame_files:
+            s3_folder_path = f"s3://{LABELLING_S3_BUCKET}/{LABELLING_S3_PREFIX}/{formatted_uuid}/v_frames/0/0/"
+            os.system(f"aws s3 cp {frame_file} {s3_folder_path} --quiet")
+        logger.debug(f"Uploaded frames for {each_df_row['avid']} to {s3_folder_path}")
+    except Exception as e:
+        logger.error(f"Error uploading frames for video {each_df_row['avid']} to S3: {e}")
 
     # removing the entire folder to save space
     try:
@@ -111,6 +197,8 @@ if __name__ == "__main__":
     logger.remove()
     logger.add(sys.stderr, level=LOG_LEVEL)
 
+    # add your AWS credentials here if not already configured in your environment
+            
     query = '''
       SELECT avid, s3_bucket
       FROM video_catalog
@@ -130,7 +218,8 @@ if __name__ == "__main__":
     logger.info(f'Found {len(summary_json_paths)} summary.json files')
 
     # Run in parallel, get a list of DataFrames
-    events = p_tqdm.p_map(get_EEC_events, summary_json_paths[:1000], num_cpus=multiprocessing.cpu_count(), desc='Processing EEC outputs')
+    # summary_json_paths = np.random.choice(summary_json_paths, size=2000, replace=False) # taking a random subset
+    events = p_tqdm.p_map(get_EEC_events, summary_json_paths, num_cpus=multiprocessing.cpu_count(), desc='Processing EEC outputs')
     events_df = pd.concat(events, ignore_index=True)
      
     # Filter out rows with null event_code
@@ -141,17 +230,20 @@ if __name__ == "__main__":
     logger.info(f"Events dataframe shape: {events_df.shape}, Events DataFrame sample:\n{events_df.head()}")
 
     # Further filter events based on duration
-    cond1 = (events_df['end_timestamp'] - events_df['start_timestamp']) >= 2
-    cond2 = (events_df['end_timestamp'] - events_df['start_timestamp']) <= 2.5
+    cond1 = (events_df['end_timestamp'] - events_df['start_timestamp']) >= 1800 # at least 2000 milliseconds
+    cond2 = (events_df['end_timestamp'] - events_df['start_timestamp']) <= 2100 # at most 2500 milliseconds
     filtered_events_df = events_df[cond1 & cond2]   
     logger.info(f"filtering the df to get events which are between 2 to 2.5, and its length is {filtered_events_df.shape}")
 
-    merged_df = pd.merge(events_df, s3_path_list, on='avid', how='inner')
+    merged_df = pd.merge(filtered_events_df, s3_path_list, on='avid', how='inner')
+    logger.info(f"Merged DataFrame sample:\n{merged_df.head()}")
     logger.info(f"Merged DataFrame shape: {merged_df.shape}")
+
     # process each video in parallel
     p_tqdm.p_map(process_video, 
                  merged_df.to_dict('records'), 
                  num_cpus= multiprocessing.cpu_count(), 
                  desc=' processing videos',
                  disable= LOG_LEVEL == "DEBUG")
+    # process_video(merged_df.to_dict('records')) # for testing purpose only processing some video
     logger.info("Processing completed.")
