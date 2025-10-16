@@ -14,8 +14,8 @@ from PIL import ImageDraw, Image
 
 FPS =  30
 LABELLING_S3_BUCKET = 'netradyne-labelling-production'
-LABELLING_S3_PREFIX = 'dms_eec_alert_level_labelling_robust_v0.1'
-VIDEO_OFFSET = 500 # offset in milliseconds to start the video before the event start time
+LABELLING_S3_PREFIX = 'dms_eec_alert_level_labelling_AN25908_v0.1'
+VIDEO_OFFSET = 1500 # offset in milliseconds to start the video before the event start time
 
 def get_EEC_events(json_path: str) -> pd.DataFrame:
     """
@@ -112,7 +112,8 @@ def annotate_frames(frame_files: list[str],
             logger.error(f"Error annotating frame {frame_file}: {e} and corresponding df row is {each_df_row}")
     return 
 
-def process_video(each_df_row: dict) -> None:
+def process_video(each_df_row: dict,
+                  lock= None) -> None:
     """
     Processes a single video based on metadata from a DataFrame row.
     1. Downloads video from S3.
@@ -146,20 +147,21 @@ def process_video(each_df_row: dict) -> None:
         start_time = max(0, int(each_df_row['start_timestamp'] - VIDEO_OFFSET))  # in milliseconds
         end_time = min(video_duration, int(each_df_row['end_timestamp'] + VIDEO_OFFSET))  # in milliseconds
         duration = end_time - start_time
-        os.system(f"ffmpeg -ss {start_time/1000} -i {local_video_path} -t {duration/1000} -vf fps={FPS} -start_number 0 {frames_dir}/%04d.jpg > /dev/null 2>&1")
+        os.system(f"ffmpeg -ss {start_time/1000} -i {local_video_path} -t {duration/1000} -vf fps={FPS} -start_number 0 {frames_dir}/%d.jpg > /dev/null 2>&1")
         logger.debug(f"Extracted frames to {frames_dir} from {start_time} to {end_time} seconds")
     except Exception as e:
         logger.error(f"Error in extracting frames for video {each_df_row['avid']}: {e}")
 
     # annotate frames
     try:
-        frame_files = sorted(glob.glob(f"{frames_dir}/*.jpg")) # frame files containing full path in a sorted manner
+        frame_files = glob.glob(f"{frames_dir}/*.jpg") # frame files containing full path
         event_start_frame, event_end_frame = calculate_frame_numbers(video_start=start_time,
                                                                      video_end=end_time,
                                                                      event_start=each_df_row['start_timestamp'],
                                                                      event_end=each_df_row['end_timestamp'], 
                                                                      each_df_row=each_df_row)
-        annotate_frames(frame_files, event_start_frame, event_end_frame, each_df_row)        
+        annotate_frames(frame_files, event_start_frame, event_end_frame, each_df_row)
+        logger.debug(f"frames are annotated present in the folder: {frames_dir}") 
     except Exception as e:
         logger.error(f"Error annotating frames for video {each_df_row['avid']}: {e}")
 
@@ -168,7 +170,7 @@ def process_video(each_df_row: dict) -> None:
     formatted_uuid = f"{temp_uuid[:8]}-{temp_uuid[8:12]}-{temp_uuid[12:16]}-{temp_uuid[16:20]}-{temp_uuid[20:]}"
     try:
         for frame_file in frame_files:
-            s3_folder_path = f"s3://{LABELLING_S3_BUCKET}/{LABELLING_S3_PREFIX}/{formatted_uuid}/v_frames/0/0/"
+            s3_folder_path = f"s3://{LABELLING_S3_BUCKET}/{LABELLING_S3_PREFIX}/{formatted_uuid}/vframes/0/0/"
             os.system(f"aws s3 cp {frame_file} {s3_folder_path} --quiet")
         logger.debug(f"Uploaded frames for {each_df_row['avid']} to {s3_folder_path}")
     except Exception as e:
@@ -180,7 +182,11 @@ def process_video(each_df_row: dict) -> None:
         logger.debug(f"Removed temporary files for {each_df_row['uuid']}")
     except Exception as e:
         logger.error(f"Error removing temporary files for {each_df_row['avid']}: {e}")
-
+    if lock is not None:
+        with lock:
+            with open("processed_uuids.txt", "a") as f:
+                f.write(f"{each_df_row['uuid']}\n")
+        os.system("cat processed_uuids.txt | wc -l")
     return
 
 
@@ -192,61 +198,83 @@ if __name__ == "__main__":
     3. Merges event data with video metadata.
     4. Processes each video to extract and upload frames.
     """
+
     # Set up logging
-    LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+    LOG_LEVEL = os.getenv("LOG_LEVEL", "DEBUG").upper()
     logger.remove()
     logger.add(sys.stderr, level=LOG_LEVEL)
+    # creating a new log file
+    logger.add("upload_data_for_labelling.log", rotation="0", level=LOG_LEVEL, mode= "w")
+
+    # Check AWS credentials
+    if 'AWS_ACCESS_KEY_ID' not in os.environ:
+        logger.error("ERROR: AWS_ACCESS_KEY_ID is not set. Exiting.")
+        sys.exit(1)
 
     # add your AWS credentials here if not already configured in your environment
     # os.environ['AWS_ACCESS_KEY_ID'] = 'your_access_key_id'
     # os.environ['AWS_SECRET_ACCESS_KEY'] = 'your
     # os.environ['AWS_SESSION_TOKEN'] = 'your_session_token'
-            
-    query = '''
-      SELECT avid, s3_bucket
-      FROM video_catalog
-      WHERE dms_video_file IS NOT NULL
-        AND is_external_video = FALSE
-      LIMIT 1000;
-    '''
-    kpi_con = create_engine(f'postgresql://prithvi.ram:a40f2f11e0@analytics.cjtip3nhxyf3.us-west-1.rds.amazonaws.com:5432/kpis')
-    s3_path_list = pd.read_sql_query(query, kpi_con) # reading from the kpi db
-    s3_path_list = s3_path_list.astype(str) # converting everything to string
-    logger.info("------------------- s3 path list -------------------")
-    logger.info(f"\n{s3_path_list.head()}")
 
-    base_dir = '/inwdata2/Prithvi/AN_25908_eec_recall_improvement/dms_submit_job_141184/'
-    logger.info(f"reading summary json files from {base_dir}")
-    summary_json_paths = glob.glob(f'{base_dir}*/summary.json')
-    logger.info(f'Found {len(summary_json_paths)} summary.json files')
+    # # fetch video s3 paths from the database
+    # s3_path_list = pd.read_csv('/inwdata2/Prithvi/GIT/work/AN25908/eec_69k_labelling_with_avid_s3Path.csv') # reading from a csv file
+    # s3_path_list = s3_path_list.astype(str) # converting everything to string
+    # logger.info("------------------- s3 path list -------------------")
+    # logger.info(f"\n{s3_path_list.head()}")
 
-    # Run in parallel, get a list of DataFrames
-    # summary_json_paths = np.random.choice(summary_json_paths, size=2000, replace=False) # taking a random subset
-    events = p_tqdm.p_map(get_EEC_events, summary_json_paths, num_cpus=multiprocessing.cpu_count(), desc='Processing EEC outputs')
-    events_df = pd.concat(events, ignore_index=True)
-     
-    # Filter out rows with null event_code
-    events_df = events_df[events_df['event_code'].notnull()]
-    # converting avid, avid_folder_name event_code, uuid, alert_id to string
-    for col in ['avid', 'avid_folder_name', 'event_code', 'uuid', 'alert_id']: 
-        events_df[col] = events_df[col].astype(str)
-    logger.info(f"Events dataframe shape: {events_df.shape}, Events DataFrame sample:\n{events_df.head()}")
+    # # read summary json files to get EEC events
+    # base_dir = '/inwdata2/Prithvi/AN_25908_eec_recall_improvement/dms_submit_job_141184/'
+    # logger.info(f"reading summary json files from {base_dir}")
+    # summary_json_paths = glob.glob(f'{base_dir}*/summary.json')
+    # logger.info(f'Found {len(summary_json_paths)} summary.json files')
 
-    # Further filter events based on duration
-    cond1 = (events_df['end_timestamp'] - events_df['start_timestamp']) >= 1800 # at least 2000 milliseconds
-    cond2 = (events_df['end_timestamp'] - events_df['start_timestamp']) <= 2100 # at most 2500 milliseconds
-    filtered_events_df = events_df[cond1 & cond2]   
-    logger.info(f"filtering the df to get events which are between 2 to 2.5, and its length is {filtered_events_df.shape}")
+    # # Run in parallel, get a list of DataFrames
+    # # summary_json_paths = np.random.choice(summary_json_paths, size=2000, replace=False) # taking a random subset
+    # events = p_tqdm.p_map(get_EEC_events, summary_json_paths, num_cpus=multiprocessing.cpu_count(), desc='Processing EEC outputs')
+    # events_df = pd.concat(events, ignore_index=True)
 
-    merged_df = pd.merge(filtered_events_df, s3_path_list, on='avid', how='inner')
+    # # Filter out rows with null event_code
+    # events_df = events_df[events_df['event_code'].notnull()]
+    # # converting avid, avid_folder_name event_code, uuid, alert_id to string
+    # for col in ['avid', 'avid_folder_name', 'event_code', 'uuid', 'alert_id']: 
+    #     events_df[col] = events_df[col].astype(str)
+    # logger.info(f"Events dataframe shape: {events_df.shape}, Events DataFrame sample:\n{events_df.head()}")
+
+    # # Further filter events based on duration
+    # cond1 = (events_df['end_timestamp'] - events_df['start_timestamp']) >= 1800 # at least 1800 milliseconds
+    # cond2 = (events_df['end_timestamp'] - events_df['start_timestamp']) <= 2100 # at most 2100 milliseconds
+    # filtered_events_df = events_df[cond1 & cond2]   
+    # logger.info(f"filtering the df to get events which are between 1.8 to 2.1, and its length is {filtered_events_df.shape}")
+
+    # merged_df = pd.merge(events_df, s3_path_list, on='avid', how='inner')
+    # merged_df.to_csv('avid_uuid_s3_path.csv', index=False) # saving the merged df for future reference
+    # logger.info(f"Merged DataFrame sample:\n{merged_df.head()}")
+    # logger.info(f"Merged DataFrame shape: {merged_df.shape}")
+
+    merged_df = pd.read_csv('/inwdata2/Prithvi/GIT/work/AN25908/avid_uuid_s3_path.csv') # reading the merged df from a csv file
     logger.info(f"Merged DataFrame sample:\n{merged_df.head()}")
     logger.info(f"Merged DataFrame shape: {merged_df.shape}")
+    cond1 = (merged_df['end_timestamp'] - merged_df['start_timestamp']) >= 1400 # at least 1400 milliseconds
+    cond2 = (merged_df['end_timestamp'] - merged_df['start_timestamp']) <= 2100 # at most 2100 milliseconds
+    window_filtered_events_df = merged_df[cond1 & cond2]   
+    logger.info(f"filtering the df to get events which are between 1.4 to 2.1, and its length is {window_filtered_events_df.shape}")
+
+    # read already processed uuids
+    if os.path.exists("processed_uuids.txt"):
+        with open("processed_uuids.txt", "r") as f:
+            processed_uuids = f.read().splitlines()
+        filtered_events_df = window_filtered_events_df[~window_filtered_events_df['uuid'].isin(processed_uuids)]
+    else:
+        filtered_events_df = window_filtered_events_df
+    logger.info(f"After removing already processed uuids, {filtered_events_df.shape} rows remain to be processed.")
+
+    lock = multiprocessing.Lock() # to prevent multiple processes from writing to the log file simultaneously
 
     # process each video in parallel
-    p_tqdm.p_map(process_video, 
-                 merged_df.to_dict('records'), 
-                 num_cpus= multiprocessing.cpu_count(), 
+    p_tqdm.p_map(lambda row: process_video(row, lock=lock),
+                 filtered_events_df.to_dict('records'), 
+                 num_cpus= 48, 
                  desc=' processing videos',
                  disable= LOG_LEVEL == "DEBUG")
-    # process_video(merged_df.to_dict('records')) # for testing purpose only processing some video
+    # process_video(filtered_events_df.to_dict('records')[0]) # for testing purpose only processing some video
     logger.info("Processing completed.")
