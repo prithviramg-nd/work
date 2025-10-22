@@ -12,10 +12,11 @@ from sqlalchemy import create_engine
 from moviepy.editor import VideoFileClip
 from PIL import ImageDraw, Image
 
-FPS =  30
+FPS =  10
 LABELLING_S3_BUCKET = 'netradyne-labelling-production'
-LABELLING_S3_PREFIX = 'dms_eec_alert_level_labelling_AN25908_v0.1'
-VIDEO_OFFSET = 1500 # offset in milliseconds to start the video before the event start time
+LABELLING_S3_PREFIX = 'dms_eec_alert_level_labelling_AN25908_v0.3'
+VIDEO_OFFSET = 2000 # offset in milliseconds to start the video before the event start time
+IMAGE_INDEX_OFFSET = 6 # number of frames to include before the event start frame
 
 def get_EEC_events(json_path: str) -> pd.DataFrame:
     """
@@ -31,17 +32,20 @@ def get_EEC_events(json_path: str) -> pd.DataFrame:
     with open(json_path, 'r') as f:
         jsonDict = json.load(f)
     alerts = jsonDict['inference_data']['events_data']['alerts']
+    eec_event_obs = jsonDict['inference_data']['dms']['dms_drowsy']['extended_ec']['event_info']
+    eec_event_index = 0
     for each_alert in alerts:
         if each_alert['event_code'] == "401.1.5.0.0":
             rows.append({
                 'avid': avid,
                 'avid_folder_name': avid_folder_name,
-                'start_timestamp': each_alert['start_timestamp'],
-                'end_timestamp': each_alert['end_timestamp'],
+                'start_timestamp': (eec_event_obs[eec_event_index]['st_fidx'] - IMAGE_INDEX_OFFSET)*100,  # converting to milliseconds
+                'end_timestamp': eec_event_obs[eec_event_index]['et_fidx']*100,  # converting to milliseconds
                 'event_code': each_alert['event_code'],
                 'uuid': each_alert['uuid'],
                 'alert_id': each_alert['alert_id'],
             })
+            eec_event_index += 1
     return pd.DataFrame(rows) if rows else pd.DataFrame([{
         'avid': avid,
         'avid_folder_name': avid_folder_name,
@@ -206,15 +210,18 @@ if __name__ == "__main__":
     # creating a new log file
     logger.add("upload_data_for_labelling.log", rotation="0", level=LOG_LEVEL, mode= "w")
 
+    # add your AWS credentials here if not already configured in your environment
+    # os.environ['AWS_ACCESS_KEY_ID'] = ""
+    # os.environ['AWS_SECRET_ACCESS_KEY'] = ""
+    # os.environ['AWS_SESSION_TOKEN'] = ""
+
     # Check AWS credentials
     if 'AWS_ACCESS_KEY_ID' not in os.environ:
         logger.error("ERROR: AWS_ACCESS_KEY_ID is not set. Exiting.")
         sys.exit(1)
-
-    # add your AWS credentials here if not already configured in your environment
-    # os.environ['AWS_ACCESS_KEY_ID'] = 'your_access_key_id'
-    # os.environ['AWS_SECRET_ACCESS_KEY'] = 'your
-    # os.environ['AWS_SESSION_TOKEN'] = 'your_session_token'
+    # removing old temp folder if exists
+    if os.path.exists("temp"):
+        os.system("rm -rf temp")
 
     # # fetch video s3 paths from the database
     # s3_path_list = pd.read_csv('/inwdata2/Prithvi/GIT/work/AN25908/eec_69k_labelling_with_avid_s3Path.csv') # reading from a csv file
@@ -240,24 +247,19 @@ if __name__ == "__main__":
     #     events_df[col] = events_df[col].astype(str)
     # logger.info(f"Events dataframe shape: {events_df.shape}, Events DataFrame sample:\n{events_df.head()}")
 
-    # # Further filter events based on duration
-    # cond1 = (events_df['end_timestamp'] - events_df['start_timestamp']) >= 1800 # at least 1800 milliseconds
-    # cond2 = (events_df['end_timestamp'] - events_df['start_timestamp']) <= 2100 # at most 2100 milliseconds
-    # filtered_events_df = events_df[cond1 & cond2]   
-    # logger.info(f"filtering the df to get events which are between 1.8 to 2.1, and its length is {filtered_events_df.shape}")
-
     # merged_df = pd.merge(events_df, s3_path_list, on='avid', how='inner')
-    # merged_df.to_csv('avid_uuid_s3_path.csv', index=False) # saving the merged df for future reference
+    # merged_df.to_csv('/inwdata2/Prithvi/GIT/work/AN25908/avid_uuid_s3_path.csv', index=False) # saving the merged df for future reference
     # logger.info(f"Merged DataFrame sample:\n{merged_df.head()}")
     # logger.info(f"Merged DataFrame shape: {merged_df.shape}")
 
     merged_df = pd.read_csv('/inwdata2/Prithvi/GIT/work/AN25908/avid_uuid_s3_path.csv') # reading the merged df from a csv file
+    merged_df = merged_df.sample(frac=1).reset_index(drop=True) # random shuffling the dataframe
     logger.info(f"Merged DataFrame sample:\n{merged_df.head()}")
     logger.info(f"Merged DataFrame shape: {merged_df.shape}")
-    cond1 = (merged_df['end_timestamp'] - merged_df['start_timestamp']) >= 1400 # at least 1400 milliseconds
-    cond2 = (merged_df['end_timestamp'] - merged_df['start_timestamp']) <= 2100 # at most 2100 milliseconds
+    cond1 = (merged_df['end_timestamp'] - merged_df['start_timestamp']) >= 1300 # at least 1300 milliseconds
+    cond2 = (merged_df['end_timestamp'] - merged_df['start_timestamp']) <= 2500 # at most 2500 milliseconds
     window_filtered_events_df = merged_df[cond1 & cond2]   
-    logger.info(f"filtering the df to get events which are between 1.4 to 2.1, and its length is {window_filtered_events_df.shape}")
+    logger.info(f"filtering the df to get events which are between 1.3 to 2.5, and its length is {window_filtered_events_df.shape}")
 
     # read already processed uuids
     if os.path.exists("processed_uuids.txt"):
