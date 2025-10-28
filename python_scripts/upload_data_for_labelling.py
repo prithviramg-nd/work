@@ -14,7 +14,7 @@ from PIL import ImageDraw, Image
 
 FPS =  10
 LABELLING_S3_BUCKET = 'netradyne-labelling-production'
-LABELLING_S3_PREFIX = 'dms_eec_alert_level_labelling_AN25908_v0.3'
+LABELLING_S3_PREFIX = 'dms_eec_alert_level_labelling_AN25908_v0.5'
 VIDEO_OFFSET = 2000 # offset in milliseconds to start the video before the event start time
 IMAGE_INDEX_OFFSET = 6 # number of frames to include before the event start frame
 
@@ -48,7 +48,7 @@ def get_EEC_events(json_path: str) -> pd.DataFrame:
             eec_event_index += 1
     return pd.DataFrame(rows) if rows else pd.DataFrame([{
         'avid': avid,
-        'avid_folder_name': avid_folder_name,
+        'avid_folder_name': avid_folder_name, 
         'start_timestamp': None,
         'end_timestamp': None,
         'event_code': None,
@@ -190,7 +190,7 @@ def process_video(each_df_row: dict,
         with lock:
             with open("processed_uuids.txt", "a") as f:
                 f.write(f"{each_df_row['uuid']}\n")
-        os.system("cat processed_uuids.txt | wc -l")
+            os.system("cat processed_uuids.txt | wc -l")
     return
 
 
@@ -256,10 +256,10 @@ if __name__ == "__main__":
     merged_df = merged_df.sample(frac=1).reset_index(drop=True) # random shuffling the dataframe
     logger.info(f"Merged DataFrame sample:\n{merged_df.head()}")
     logger.info(f"Merged DataFrame shape: {merged_df.shape}")
-    cond1 = (merged_df['end_timestamp'] - merged_df['start_timestamp']) >= 1300 # at least 1300 milliseconds
+    cond1 = (merged_df['end_timestamp'] - merged_df['start_timestamp']) >= 1700 # at least 1700 milliseconds
     cond2 = (merged_df['end_timestamp'] - merged_df['start_timestamp']) <= 2500 # at most 2500 milliseconds
     window_filtered_events_df = merged_df[cond1 & cond2]   
-    logger.info(f"filtering the df to get events which are between 1.3 to 2.5, and its length is {window_filtered_events_df.shape}")
+    logger.info(f"filtering the df to get events which are between 1.7 to 2.5, and its length is {window_filtered_events_df.shape}")
 
     # read already processed uuids
     if os.path.exists("processed_uuids.txt"):
@@ -275,7 +275,7 @@ if __name__ == "__main__":
     # process each video in parallel
     p_tqdm.p_map(lambda row: process_video(row, lock=lock),
                  filtered_events_df.to_dict('records'), 
-                 num_cpus= 48, 
+                 num_cpus= 12, 
                  desc=' processing videos',
                  disable= LOG_LEVEL == "DEBUG")
     # process_video(filtered_events_df.to_dict('records')[0]) # for testing purpose only processing some video
