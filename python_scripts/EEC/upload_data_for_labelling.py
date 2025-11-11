@@ -275,7 +275,7 @@ if __name__ == "__main__":
     # process each video in parallel
     p_tqdm.p_map(lambda row: process_video(row, lock=lock),
                  filtered_events_df.to_dict('records'), 
-                 num_cpus= 12, 
+                 num_cpus= 48,
                  desc=' processing videos',
                  disable= LOG_LEVEL == "DEBUG")
     # process_video(filtered_events_df.to_dict('records')[0]) # for testing purpose only processing some video

@@ -7,6 +7,7 @@ import subprocess
 import boto3
 import sys
 import json
+import re
 from io import StringIO
 
 BUCKET_NAME = "netradyne-labelling-production"
@@ -35,19 +36,51 @@ def extract_label_info(uuid_folder_name: str) -> dict:
         if 'Contents' not in response:
             logger.warning(f"No annotations_attribute folder found for {uuid_folder_name}")
             return None
+        
+        obj = response['Contents']
+        folder_pattern = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}$")
+
+        folder_list = sorted({
+            o['Key'].split('/')[-2]
+            for o in obj
+            if 'annotations_attribute/' in o['Key']
+               and o['Key'].count('/') > 3
+               and folder_pattern.match(o['Key'].split('/')[-2])
+        })
+
+        valid_folders = [f for f in folder_list if f >= '2025-11-08_12-07-16']
+
+        if not valid_folders:
+            logger.warning(f"No valid annotation folders found for {uuid_folder_name}")
+            return None
+
     except Exception as e:
         logger.error(f"Error accessing S3 for folder {uuid_folder_name}: {e}")
         return None
     
     try:
-        labels_file_key = f"{S3_FOLDER_PATH}/{uuid_folder_name}/annotations_attribute/latest/labels.txt"
+        latest_folder = max(valid_folders)
+        logger.info(f"Latest annotation folder for {uuid_folder_name}: {latest_folder}")
+        labels_file_key = f"{S3_FOLDER_PATH}/{uuid_folder_name}/annotations_attribute/{latest_folder}/labels.txt"
         obj = s3_client.get_object(Bucket=BUCKET_NAME, Key=labels_file_key)
         labels_content = obj['Body'].read().decode('utf-8')
-        df = pd.read_csv(StringIO(labels_content),
-                         sep=" ",
-                         header=None,
-                         names=['checkbox_id', 'frame_idx', 'category', 'label'])
+        
+        try:
+            df = pd.read_csv(StringIO(labels_content),
+                             sep=" ",
+                             header=None,
+                             names=['checkbox_id', 'frame_idx', 'category', 'label'])
+        except pd.errors.ParserError: # Error tokenizing data
+            df = pd.read_csv(StringIO(labels_content),
+                                sep=" ",
+                                header=None,
+                                names=['checkbox_id', 'frame_idx', 'category', 'label', 'extra'])
+            # combine extra columns into label
+            df['label'] = df[['label', 'extra']].astype(str).agg(' '.join, axis=1)
+
+        df = df[['checkbox_id', 'frame_idx', 'category', 'label']]
         logger.debug(f"shape of labels.txt for {uuid_folder_name}: {df.shape}")
+
 
         # remove quotes and clean data
         df['category'] = df['category'].str.replace('"', '', regex=False)
@@ -106,20 +139,24 @@ if __name__ == "__main__":
     folders = [f.replace("PRE", "").strip().replace("/", "") for f in folders]
     logger.info(f"sample folders: {folders[:5]}")
     # extract label info for all folders in parallel
-    all_label_info = p_tqdm.p_map(extract_label_info,
-                                  folders,  # limiting to first 500 for testing
-                                  num_cpus=48,
-                                  desc="Extracting label info",
-                                  disable=True)  
-    
-    # Filter out None results
-    all_label_info = [row for row in all_label_info if row is not None]
-    final_df = pd.DataFrame(all_label_info)
-    print(f"final dataframe shape before cleaning: {final_df.shape}")
-    final_df.dropna(inplace=True, how='all', subset=final_df.columns[3:])
-    final_df = final_df[['uuid', 'start_frame', 'end_frame'] + [col for col in final_df.columns if col not in ['uuid', 'start_frame', 'end_frame']]]
+    # all_label_info = p_tqdm.p_map(extract_label_info,
+    #                               folders,
+    #                               num_cpus=48,
+    #                               desc="Extracting label info",
+    #                               disable=True) 
+    ret = extract_label_info("0c1ddcc5-6663-4c86-870c-1c909dea731f")
+    print(ret)
 
-    # saving dataframe to csv
-    final_df.to_csv("/inwdata2/Prithvi/GIT/work/AN25908/eec_annotations.csv", index=False)
-    logger.info(f"annotation dataframe shape: {final_df.shape}")
-    logger.info(f"annotation data sample:\n{final_df.head(5)}")
+ 
+    
+    # # Filter out None results
+    # all_label_info = [row for row in all_label_info if row is not None]
+    # final_df = pd.DataFrame(all_label_info)
+    # print(f"final dataframe shape before cleaning: {final_df.shape}")
+    # final_df.dropna(inplace=True, how='all', subset=final_df.columns[3:])
+    # final_df = final_df[['uuid', 'start_frame', 'end_frame'] + [col for col in final_df.columns if col not in ['uuid', 'start_frame', 'end_frame']]]
+
+    # # saving dataframe to csv
+    # final_df.to_csv("/inwdata2/Prithvi/GIT/work/AN25908/eec_annotations.csv", index=False)
+    # logger.info(f"annotation dataframe shape: {final_df.shape}")
+    # logger.info(f"annotation data sample:\n{final_df.head(5)}")
